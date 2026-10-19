@@ -536,8 +536,22 @@ impl Workspace {
     fn send(&mut self, ds: u64, req: Req, p: Pending) {
         let tag = self.next_tag;
         self.next_tag += 1;
-        if let Some(c) = self.sources.iter().find(|s| s.ds.id == ds).and_then(|s| s.conn.as_ref()) {
+        let src = self.sources.iter().find(|s| s.ds.id == ds);
+        if let Some(c) = src.and_then(|s| s.conn.as_ref()) {
             c.send(tag, req);
+            self.pending.insert(tag, p);
+        } else if matches!(
+            p,
+            Pending::Run(..) | Pending::DataPage(..) | Pending::ResultPage(_) | Pending::Save(..) | Pending::Cmd(..) | Pending::Ddl(..) | Pending::Alter(..)
+        ) {
+            // no connection (failed, or waiting for a password): answer with an error instead of
+            // leaving a console "running" / a grid loading forever
+            let why = match src.map(|s| &s.state) {
+                Some(ConnState::Failed(e)) => e.clone(),
+                _ => "not connected".into(),
+            };
+            let name = src.map_or(String::new(), |s| s.ds.name.clone());
+            let _ = self.tx.send(Resp { tag, body: Err(format!("{name}: {why}")) });
             self.pending.insert(tag, p);
         }
     }
@@ -1189,7 +1203,7 @@ impl Workspace {
         }
     }
 
-    fn run_console(&mut self, idx: usize, cursor: Option<std::ops::Range<usize>>) {
+    fn run_console(&mut self, ctx: &egui::Context, idx: usize, cursor: Option<std::ops::Range<usize>>) {
         let Some(Tab::Console(c)) = self.tabs.get_mut(idx) else {
             return;
         };
@@ -1244,6 +1258,8 @@ impl Workspace {
                 remember_console(&mut self.cfg, c);
             }
         }
+        // Execute (re)connects the console's data source, like DataGrip
+        self.connect(ctx, ds);
         self.send(ds, Req::Run { db, schema, script }, Pending::Run(id, ds, std::time::Instant::now()));
     }
 
@@ -2307,7 +2323,7 @@ impl Workspace {
             }
         }
         if let Some(cursor) = run {
-            self.run_console(active, cursor);
+            self.run_console(&ui.ctx().clone(), active, cursor);
         }
         if let Some((ds, console)) = open_history {
             self.open_history(ds, console);

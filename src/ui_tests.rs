@@ -1022,3 +1022,42 @@ fn postgres_modify_table() {
     assert_eq!(cols, [("id".into(), true), ("note".into(), true)]);
     pg.batch_execute("drop schema ui_mod cascade").unwrap();
 }
+
+/// Execute on a data source that isn't connected (here: no password yet) reports why in Output instead
+/// of leaving the console "running" with the request silently dropped.
+#[test]
+fn console_execute_without_connection_reports_error() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut h = harness_with(
+        || {
+            use crate::config::{Auth, Config, DataSource, Driver};
+            let mut ds = DataSource {
+                id: 3,
+                name: "locked-mongo".into(),
+                host: "127.0.0.1".into(),
+                port: "27018".into(),
+                user: "nobody".into(),
+                auth: Auth::UserPassword,
+                ..DataSource::new(Driver::Mongo)
+            };
+            ds.url = ds.generated_url();
+            crate::config::save_project(&crate::config::projects_home().join("DataTired"), &Config { sources: vec![ds], ..Default::default() });
+        },
+        0.25,
+    );
+    explorer_node(&h, "locked-mongo").click();
+    h.step();
+    h.key_press_modifiers(Modifiers::COMMAND | Modifiers::SHIFT, Key::L);
+    settle(&mut h);
+    // the console asks for the password first; dismiss it
+    if h.query_by_label("Cancel").is_some() {
+        h.get_by_label("Cancel").click();
+        settle(&mut h);
+    }
+    click_at(&mut h, Pos2::new(800.0, 300.0));
+    h.event(egui::Event::Text("db.import_requests.find().toArray()".into()));
+    h.step();
+    h.get_by_label("Execute").click();
+    wait(&mut h, "error in Output", |h| h.query_by_label_contains("Enter the password for user 'nobody'").is_some());
+    assert!(!h.get_by_label("Execute").accesskit_node().is_disabled(), "console is not left running");
+}

@@ -221,7 +221,11 @@ impl Conn {
             };
             for (tag, req) in rx {
                 cancel2.store(false, Ordering::Relaxed);
-                let body = handle(req);
+                // a bug must not leave the request unanswered (the console would stay "running")
+                let body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle(req))).unwrap_or_else(|p| {
+                    let msg = p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()));
+                    Err(format!("Internal error: {}", msg.unwrap_or_else(|| "panic".into())))
+                });
                 if out.send(Resp { tag, body }).is_err() {
                     return;
                 }
@@ -288,8 +292,8 @@ impl Worker {
         let printed = Rc::new(RefCell::new(Vec::new()));
         cx.with(|ctx| -> Result<(), String> {
             let g = ctx.globals();
-            let cl = client.clone();
-            let native = Function::new(ctx.clone(), move |s: String| native(&cl, &s).to_string()).map_err(err)?;
+            let (cl, stop) = (client.clone(), cancel.clone());
+            let native = Function::new(ctx.clone(), move |s: String| native(&cl, &stop, &s).to_string()).map_err(err)?;
             g.set("__native", native).map_err(err)?;
             let p = printed.clone();
             let print = Function::new(ctx.clone(), move |s: String| p.borrow_mut().push(s)).map_err(err)?;
@@ -330,7 +334,7 @@ impl Worker {
             Req::Run { db, script, .. } => Ok(Body::Ran(self.run(&db, &script))),
             Req::Page { spec, offset, limit } => {
                 let t = Instant::now();
-                let (docs, more) = exec_spec(c, &spec, offset, Some(limit))?;
+                let (docs, more) = exec_spec(c, &spec, offset, Some(limit), &self.cancel)?;
                 let ms = t.elapsed().as_millis();
                 Ok(Body::Rows(ResultSet {
                     title: title_of(&spec),
@@ -484,9 +488,17 @@ impl Worker {
             }
             _ => {}
         }
+        // `db.c.find(…).toArray()` as a statement's result: page through the cursor like `find(…)`
+        // instead of pulling every document (up to 100 000) through the JS engine first
+        let lazy = (stmt.starts_with("db.") || stmt.starts_with("db[")) && stmt.ends_with(".toArray()");
+        let src = if lazy { &stmt[..stmt.len() - ".toArray()".len()] } else { stmt };
         let desc = self.cx.with(|ctx| -> Result<String, String> {
             ctx.globals().set("__currentDb", db.as_str()).map_err(err)?;
-            let v: Value = ctx.eval(stmt.as_bytes().to_vec()).map_err(|e| js_err(&ctx, e))?;
+            let mut v: Value = ctx.eval(src.as_bytes().to_vec()).map_err(|e| js_err(&ctx, e))?;
+            if lazy {
+                let finish: Function = ctx.globals().get("__finish").map_err(err)?;
+                v = finish.call((v,)).map_err(|e| js_err(&ctx, e))?;
+            }
             let f: Function = ctx.globals().get("__describe").map_err(err)?;
             let s = f.call::<_, String>((v,)).map_err(|e| js_err(&ctx, e))?;
             // keep `db` switches done from JS (db = db.getSiblingDB(...) is not supported, but use() via JS is)
@@ -500,7 +512,7 @@ impl Worker {
                     _ => return Err("bad cursor".into()),
                 };
                 let t = Instant::now();
-                let (docs, more) = exec_spec(&self.client, &spec, 0, Some(crate::PAGE))?;
+                let (docs, more) = exec_spec(&self.client, &spec, 0, Some(crate::PAGE), &self.cancel)?;
                 let fetch = t.elapsed().as_millis();
                 Ok(Some(ResultSet {
                     title: title_of(&spec),
@@ -630,7 +642,19 @@ fn num(v: Option<&Bson>) -> u64 {
 }
 
 /// Executes a find/aggregate spec. `page` = rows wanted (one extra is fetched to report `more`).
-pub fn exec_spec(c: &Client, spec: &Document, offset: u64, page: Option<u64>) -> Result<(Vec<Document>, bool), String> {
+/// Documents of a cursor spec (`page`: at most that many, plus one to tell whether there are more).
+/// `cancel` (Stop / ⌘F2) aborts between documents, so a big fetch doesn't block the connection.
+pub fn exec_spec(c: &Client, spec: &Document, offset: u64, page: Option<u64>, cancel: &AtomicBool) -> Result<(Vec<Document>, bool), String> {
+    let take = |cur: mongodb::sync::Cursor<Document>| -> Result<Vec<Document>, String> {
+        let mut docs = vec![];
+        for d in cur {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("Cancelled".into());
+            }
+            docs.push(d.map_err(err)?);
+        }
+        Ok(docs)
+    };
     let db = c.database(spec.get_str("db").unwrap_or("test"));
     let skip = num(spec.get("skip")) + offset;
     let user_limit = num(spec.get("limit"));
@@ -658,7 +682,7 @@ pub fn exec_spec(c: &Client, spec: &Document, offset: u64, page: Option<u64>) ->
             Ok(coll) => db.collection::<Document>(coll).aggregate(pipeline).run(),
             Err(_) => db.aggregate(pipeline).run(),
         };
-        cur.map_err(err)?.collect::<Result<_, _>>().map_err(err)?
+        take(cur.map_err(err)?)?
     } else {
         let coll = db.collection::<Document>(spec.get_str("coll").map_err(err)?);
         let mut f = coll.find(to_doc_b(spec.get("filter"))).skip(skip);
@@ -671,7 +695,7 @@ pub fn exec_spec(c: &Client, spec: &Document, offset: u64, page: Option<u64>) ->
         if let Some(w) = want {
             f = f.limit(w as i64);
         }
-        f.run().map_err(err)?.collect::<Result<_, _>>().map_err(err)?
+        take(f.run().map_err(err)?)?
     };
     let mut docs = docs;
     let more = page.is_some_and(|p| docs.len() as u64 > p);
@@ -750,14 +774,14 @@ pub fn type_name(v: &Bson) -> &'static str {
 }
 
 /// Bridge entry point called from JS (`__native`). Every request returns `{ok}` or `{error}`.
-fn native(c: &Client, s: &str) -> Json {
-    match op(c, s) {
+fn native(c: &Client, cancel: &AtomicBool, s: &str) -> Json {
+    match op(c, cancel, s) {
         Ok(v) => json!({ "ok": v }),
         Err(e) => json!({ "error": e }),
     }
 }
 
-fn op(c: &Client, s: &str) -> Result<Json, String> {
+fn op(c: &Client, cancel: &AtomicBool, s: &str) -> Result<Json, String> {
     let r: Json = serde_json::from_str(s).map_err(err)?;
     let name = r["op"].as_str().unwrap_or_default();
     let dbn = r["db"].as_str().unwrap_or("test");
@@ -772,7 +796,7 @@ fn op(c: &Client, s: &str) -> Result<Json, String> {
         "newUuid" => json!(bson::Uuid::new().to_string()),
         "cursor" => {
             let spec = doc_of("spec")?;
-            let (docs, _) = exec_spec(c, &spec, 0, Some(SCRIPT_FETCH_CAP))?;
+            let (docs, _) = exec_spec(c, &spec, 0, Some(SCRIPT_FETCH_CAP), cancel)?;
             Json::Array(docs.into_iter().map(|d| js(&Bson::Document(d))).collect())
         }
         "count" => {
@@ -1079,5 +1103,41 @@ mod tests {
         }
         conn.send(8, Req::Run { db: "DataTired_test".into(), schema: String::new(), script: "db.dropDatabase()".into() });
         rx.recv().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod to_array {
+    use super::*;
+    use std::sync::mpsc::channel;
+
+    /// `db.c.find(…).sort(…).toArray()` (as typed in a console) shows the cursor's first page instead of
+    /// pulling the whole collection through JS; Needs the docker mongo (127.0.0.1:27018).
+    #[test]
+    fn to_array_pages_like_find() {
+        let (tx, rx) = channel();
+        let conn = Conn::open("mongodb://127.0.0.1:27018/?serverSelectionTimeoutMS=1500".into(), tx, || {});
+        conn.send(1, Req::Connect);
+        if let Err(e) = rx.recv().unwrap().body {
+            return eprintln!("skipped, no local mongo: {e}");
+        }
+        let run = |tag, script: &str| {
+            conn.send(tag, Req::Run { db: "DataTired_to_array".into(), schema: String::new(), script: script.into() });
+            let Ok(Body::Ran(items)) = rx.recv_timeout(Duration::from_secs(60)).unwrap().body else { panic!() };
+            items
+        };
+        run(2, "db.import_requests.drop(); db.import_requests.insertMany(Array.from({length: 250}, (_, i) => ({i})))");
+        let items = run(
+            3,
+            "db.getCollection(\"import_requests\").find({\n  _id: {\n    $gte: ObjectId(\"000000000000000000000000\")\n  }\n}).sort({\n  _id: -1\n}).toArray()",
+        );
+        let rs = items.iter().find_map(|i| if let RunItem::Result(r) = i { Some(r) } else { None }).expect("result");
+        assert_eq!((rs.title.as_str(), rs.docs.len(), rs.more), ("DataTired_to_array.import_requests", crate::PAGE as usize, true));
+        assert_eq!(rs.docs[0].get_i32("i"), Ok(249), "sorted by _id desc");
+        assert!(rs.spec.is_some(), "next pages come from the cursor");
+        // toArray() inside an expression is still a real array
+        let items = run(4, "db.import_requests.find({i: {$lt: 7}}).toArray().length");
+        assert!(items.iter().any(|i| matches!(i, RunItem::Log(l, LogKind::Info) if l.ends_with("] 7"))));
+        run(5, "db.dropDatabase()");
     }
 }

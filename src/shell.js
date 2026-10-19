@@ -224,5 +224,8 @@ function __describe(v) {
   if (typeof v === "function") return __ejson({ kind: "value", value: "[Function " + (v.name || "anonymous") + "]" });
   return __ejson({ kind: "value", value: v });
 }
+// A statement's `.toArray()` left out by the Rust side: a cursor is shown page by page, anything
+// else gets its toArray() back.
+function __finish(v) { return v instanceof Cursor ? v : v.toArray(); }
 // Evaluate a JS literal (filter/sort/cell value) to EJSON.
 function __eval_literal(src) { return __ejson((0, eval)("(" + src + ")")); }

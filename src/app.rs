@@ -111,6 +111,8 @@ enum Tab {
     Console(Console),
     Data(DataTab),
     File(FileTab),
+    /// Console result opened with Execute in New Tab.
+    Result(ResultTab),
 }
 
 impl Tab {
@@ -119,6 +121,7 @@ impl Tab {
             Tab::Console(c) => c.id,
             Tab::Data(d) => d.id,
             Tab::File(f) => f.id,
+            Tab::Result(r) => r.id,
         }
     }
     fn ds(&self) -> Option<u64> {
@@ -126,6 +129,7 @@ impl Tab {
             Tab::Console(c) => Some(c.ds),
             Tab::Data(d) => Some(d.ds),
             Tab::File(_) => None,
+            Tab::Result(r) => Some(r.ds),
         }
     }
     /// Writes the backing file when it changed (consoles and files autosave like the IDE).
@@ -133,7 +137,7 @@ impl Tab {
         let (path, text, saved, last) = match self {
             Tab::Console(c) => (&c.path, &c.text, &mut c.saved, &mut c.last_save),
             Tab::File(f) => (&f.path, &f.text, &mut f.saved, &mut f.last_save),
-            Tab::Data(_) => return,
+            Tab::Data(_) | Tab::Result(_) => return,
         };
         if text != saved && (force || last.elapsed().as_secs_f32() > 1.0) {
             if let Some(d) = path.parent() {
@@ -177,7 +181,8 @@ enum Pending {
     Databases(u64),
     Colls(u64, String),
     Meta(u64, String, String),
-    Run(u64, u64, std::time::Instant),
+    /// console, data source, start, keep the console's earlier result tabs
+    Run(u64, u64, std::time::Instant, bool),
     DataPage(u64, std::time::Instant),
     ResultPage(u64),
     Save(u64, bool),
@@ -687,7 +692,7 @@ impl Workspace {
                     }
                 }
                 (Pending::Colls(_, _), Err(e)) | (Pending::Meta(_, _, _), Err(e)) => self.status = Some(e),
-                (Pending::Run(cid, ds, t0), body) => self.on_run(cid, ds, t0, body),
+                (Pending::Run(cid, ds, t0, new_tab), body) => self.on_run(cid, ds, t0, new_tab, body),
                 (Pending::DataPage(tid, t0), body) => {
                     let ms = t0.elapsed().as_millis();
                     if let Some(Tab::Data(d)) = self.tabs.iter_mut().find(|t| t.id() == tid) {
@@ -706,7 +711,7 @@ impl Workspace {
                     }
                 }
                 (Pending::ResultPage(rid), body) => {
-                    if let Some(r) = self.services.results.iter_mut().find(|r| r.id == rid) {
+                    if let Some(r) = self.results_mut().find(|r| r.id == rid) {
                         match body {
                             Ok(Body::Rows(rs)) => r.grid.set(rs),
                             Err(e) => {
@@ -829,7 +834,7 @@ impl Workspace {
         }
     }
 
-    fn on_run(&mut self, cid: u64, ds: u64, t0: std::time::Instant, body: Result<Body, String>) {
+    fn on_run(&mut self, cid: u64, ds: u64, t0: std::time::Instant, new_tab: bool, body: Result<Body, String>) {
         let ms = t0.elapsed().as_millis();
         let mut ok = true;
         let mut first_result = None;
@@ -852,8 +857,18 @@ impl Workspace {
                 }
             }
         }
-        if !new_results.is_empty() {
-            self.services.results.retain(|r| r.console != cid);
+        let mut opened = None;
+        if new_tab {
+            for grid in new_results {
+                let id = self.next_id;
+                self.next_id += 1;
+                self.tabs.push(Tab::Result(ResultTab { id, console: cid, ds, grid }));
+                opened.get_or_insert(self.tabs.len() - 1);
+            }
+        } else {
+            if !new_results.is_empty() {
+                self.services.results.retain(|r| r.console != cid);
+            }
             for grid in new_results {
                 let id = self.next_id;
                 self.next_id += 1;
@@ -861,9 +876,15 @@ impl Workspace {
                 first_result.get_or_insert(self.services.results.len());
             }
         }
-        self.services.active = if ok { first_result.unwrap_or(0) } else { 0 };
-        self.show_services = true;
-        self.show_gen = false;
+        if let Some(i) = opened {
+            self.active = i;
+        }
+        // results in editor tabs leave Services alone unless something failed
+        if opened.is_none() || !ok {
+            self.services.active = if ok { first_result.unwrap_or(0) } else { 0 };
+            self.show_services = true;
+            self.show_gen = false;
+        }
         let mut name = String::from("console");
         if let Some(Tab::Console(c)) = self.tabs.iter_mut().find(|t| t.id() == cid) {
             c.running = false;
@@ -888,7 +909,7 @@ impl Workspace {
     }
 
     fn refresh_result(&mut self, rid: u64, page: Option<(u64, u64)>) {
-        let Some(r) = self.services.results.iter_mut().find(|r| r.id == rid) else {
+        let Some(r) = self.results_mut().find(|r| r.id == rid) else {
             return;
         };
         let Some(rs) = &r.grid.rs else { return };
@@ -899,13 +920,22 @@ impl Workspace {
         self.send(ds, Req::Page { spec, offset, limit }, Pending::ResultPage(rid));
     }
 
+    /// Console results, in Services and opened as editor tabs.
+    fn results_mut(&mut self) -> impl Iterator<Item = &mut ResultTab> {
+        let tabs = self.tabs.iter_mut().filter_map(|t| match t {
+            Tab::Result(r) => Some(r),
+            _ => None,
+        });
+        self.services.results.iter_mut().chain(tabs)
+    }
+
     fn grid_mut(&mut self, t: GridTarget) -> Option<&mut Grid> {
         match t {
             GridTarget::Data(id) => self.tabs.iter_mut().find_map(|x| match x {
                 Tab::Data(d) if d.id == id => Some(&mut d.grid),
                 _ => None,
             }),
-            GridTarget::Result(id) => self.services.results.iter_mut().find(|r| r.id == id).map(|r| &mut r.grid),
+            GridTarget::Result(id) => self.results_mut().find(|r| r.id == id).map(|r| &mut r.grid),
         }
     }
 
@@ -956,7 +986,7 @@ impl Workspace {
                             Some(Tab::Data(d)) => (d.ds, Some((d.db.clone(), d.coll.clone())), id, false),
                             _ => continue,
                         },
-                        GridTarget::Result(id) => match self.services.results.iter().find(|r| r.id == id) {
+                        GridTarget::Result(id) => match self.results_mut().find(|r| r.id == id) {
                             Some(r) => (r.ds, r.grid.rs.as_ref().and_then(|x| x.table()), id, true),
                             None => continue,
                         },
@@ -968,7 +998,7 @@ impl Workspace {
                 (GridAction::Stop, t) => {
                     let ds = match t {
                         GridTarget::Data(id) => self.tabs.iter().find(|x| x.id() == id).and_then(|x| x.ds()),
-                        GridTarget::Result(id) => self.services.results.iter().find(|r| r.id == id).map(|r| r.ds),
+                        GridTarget::Result(id) => self.results_mut().find(|r| r.id == id).map(|r| r.ds),
                     };
                     if let Some(c) = ds.and_then(|ds| self.sources.iter().find(|s| s.ds.id == ds)).and_then(|s| s.conn.as_ref()) {
                         c.stop();
@@ -981,14 +1011,12 @@ impl Workspace {
                             _ => "export".into(),
                         },
                         GridTarget::Result(id) => self
-                            .services
-                            .results
-                            .iter()
+                            .results_mut()
                             .find(|r| r.id == id)
                             .and_then(|r| r.grid.rs.as_ref())
                             .map_or("result".into(), |r| r.title.clone()),
                     };
-                    let dir = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join("Downloads");
+                    let dir = config::home().join("Downloads");
                     let path = dir.join(format!("{name}.{ext}"));
                     self.status = Some(match std::fs::write(&path, text) {
                         Ok(_) => format!("Exported to {}", path.display()),
@@ -1171,21 +1199,14 @@ impl Workspace {
                 if !p.exists() && p.extension().is_none() {
                     let _ = std::fs::create_dir_all(&p); // a connection's consoles folder may not exist yet
                 }
-                let _ = std::process::Command::new("open").arg("-R").arg(p).spawn();
+                config::reveal(&p);
             }
             FileAction::Attach => {
                 // native folder picker without blocking the UI thread
                 let (tx, rx) = channel();
                 let ctx2 = ctx.clone();
                 std::thread::spawn(move || {
-                    let out = std::process::Command::new("osascript")
-                        .args(["-e", "POSIX path of (choose folder with prompt \"Attach Directory\")"])
-                        .output();
-                    let path = out
-                        .ok()
-                        .filter(|o| o.status.success())
-                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().trim_end_matches('/').to_string());
-                    let _ = tx.send(path);
+                    let _ = tx.send(config::pick_folder("Attach Directory"));
                     ctx2.request_repaint();
                 });
                 self.picker = Some(rx);
@@ -1203,7 +1224,7 @@ impl Workspace {
         }
     }
 
-    fn run_console(&mut self, ctx: &egui::Context, idx: usize, cursor: Option<std::ops::Range<usize>>) {
+    fn run_console(&mut self, ctx: &egui::Context, idx: usize, cursor: Option<std::ops::Range<usize>>, new_tab: bool) {
         let Some(Tab::Console(c)) = self.tabs.get_mut(idx) else {
             return;
         };
@@ -1260,7 +1281,7 @@ impl Workspace {
         }
         // Execute (re)connects the console's data source, like DataGrip
         self.connect(ctx, ds);
-        self.send(ds, Req::Run { db, schema, script }, Pending::Run(id, ds, std::time::Instant::now()));
+        self.send(ds, Req::Run { db, schema, script }, Pending::Run(id, ds, std::time::Instant::now(), new_tab));
     }
 
     fn save_cfg(&mut self) {
@@ -2027,37 +2048,60 @@ impl Workspace {
         // tab strip
         let strip = Rect::from_min_size(rect.min, vec2(rect.width(), 40.0));
         let mut close = None;
-        let mut x = strip.left() + 8.0;
+        let mut clicked = None;
         let titles = self.tab_titles();
-        for (i, t) in self.tabs.iter().enumerate() {
-            let (icon, title) = titles[i].clone();
-            let g = ui.painter().layout_no_wrap(title.clone(), ui_font(13.0), TEXT);
-            let w = g.size().x + 60.0;
-            let r = Rect::from_min_size(pos2(x, strip.top() + 6.0), vec2(w, 28.0));
-            let resp = ui.interact(r, Id::new(("tab", t.id())), Sense::CLICK);
-            resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, i == self.active, &title));
-            if i == self.active {
-                ui.painter().rect(r, CornerRadius::same(5), TAB_SEL_BG, Stroke::new(1.0, TAB_SEL_BORDER), egui::StrokeKind::Inside);
-            } else if resp.hovered() {
-                ui.painter().rect_filled(r, CornerRadius::same(5), TOOLBAR_HOVER);
-            }
-            paint_icon(ui, Rect::from_min_size(r.min + vec2(8.0, 6.0), vec2(16.0, 16.0)), icon);
-            let col = if i == self.active { TEXT } else { TEXT_MUTED };
-            ui.painter().galley(pos2(r.left() + 30.0, r.center().y - g.size().y / 2.0), g, col);
-            let cr = Rect::from_center_size(pos2(r.right() - 14.0, r.center().y), vec2(16.0, 16.0));
-            let cresp = ui.interact(cr, Id::new(("tabx", t.id())), Sense::CLICK);
-            if i == self.active || resp.hovered() || cresp.hovered() {
-                if cresp.hovered() {
-                    ui.painter().rect_filled(cr, CornerRadius::same(3), TOOLBAR_HOVER);
+        // tabs overflowing the strip scroll horizontally (wheel or trackpad), clipped short of the ⋮ button
+        let galleys: Vec<_> = titles.iter().map(|(_, t)| ui.painter().layout_no_wrap(t.clone(), ui_font(13.0), TEXT)).collect();
+        let total = galleys.iter().map(|g| g.size().x + 66.0).sum::<f32>() - 6.0;
+        let area = Rect::from_min_max(pos2(strip.left() + 8.0, strip.top()), strip.right_bottom() - vec2(44.0, 0.0));
+        let scroll = egui::ScrollArea::horizontal().id_salt("editor-tabs").auto_shrink([false, false]);
+        rect_ui(ui, area, |ui| {
+            // thin, muted bar in the gap under the tabs
+            let s = &mut ui.spacing_mut().scroll;
+            (s.bar_width, s.bar_outer_margin, s.foreground_color) = (4.0, 1.0, false);
+            scroll.show(ui, |ui| {
+                let (row, _) = ui.allocate_exact_size(vec2(total, 40.0), Sense::hover());
+                let mut x = row.left();
+                for (i, t) in self.tabs.iter().enumerate() {
+                    let (icon, title) = titles[i].clone();
+                    let g = galleys[i].clone();
+                    let w = g.size().x + 60.0;
+                    let r = Rect::from_min_size(pos2(x, row.top() + 6.0), vec2(w, 28.0));
+                    let resp = ui.interact(r, Id::new(("tab", t.id())), Sense::CLICK);
+                    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, i == self.active, &title));
+                    if i == self.active {
+                        // bring a newly activated tab into view
+                        let key = Id::new("editor-tabs-shown");
+                        if ui.data(|d| d.get_temp::<u64>(key)) != Some(t.id()) {
+                            ui.data_mut(|d| d.insert_temp(key, t.id()));
+                            resp.scroll_to_me(None);
+                        }
+                        ui.painter().rect(r, CornerRadius::same(5), TAB_SEL_BG, Stroke::new(1.0, TAB_SEL_BORDER), egui::StrokeKind::Inside);
+                    } else if resp.hovered() {
+                        ui.painter().rect_filled(r, CornerRadius::same(5), TOOLBAR_HOVER);
+                    }
+                    paint_icon(ui, Rect::from_min_size(r.min + vec2(8.0, 6.0), vec2(16.0, 16.0)), icon);
+                    let col = if i == self.active { TEXT } else { TEXT_MUTED };
+                    ui.painter().galley(pos2(r.left() + 30.0, r.center().y - g.size().y / 2.0), g, col);
+                    let cr = Rect::from_center_size(pos2(r.right() - 14.0, r.center().y), vec2(16.0, 16.0));
+                    let cresp = ui.interact(cr, Id::new(("tabx", t.id())), Sense::CLICK);
+                    if i == self.active || resp.hovered() || cresp.hovered() {
+                        if cresp.hovered() {
+                            ui.painter().rect_filled(cr, CornerRadius::same(3), TOOLBAR_HOVER);
+                        }
+                        paint_icon_tinted(ui, cr, ic::CLOSE_SMALL, TEXT_MUTED);
+                    }
+                    if cresp.clicked() || resp.middle_clicked() {
+                        close = Some(i);
+                    } else if resp.clicked() {
+                        clicked = Some(i);
+                    }
+                    x += w + 6.0;
                 }
-                paint_icon_tinted(ui, cr, ic::CLOSE_SMALL, TEXT_MUTED);
-            }
-            if cresp.clicked() || resp.middle_clicked() {
-                close = Some(i);
-            } else if resp.clicked() {
-                self.active = i;
-            }
-            x += w + 6.0;
+            })
+        });
+        if let Some(i) = clicked {
+            self.active = i;
         }
         row_ui(ui, Rect::from_min_max(pos2(strip.right() - 40.0, strip.top() + 7.0), strip.right_bottom() - vec2(8.0, 7.0)), |ui| {
             icon_btn(ui, ic::MORE_VERTICAL, "");
@@ -2151,6 +2195,7 @@ impl Workspace {
             }
         }
         let mut run: Option<Option<std::ops::Range<usize>>> = None;
+        let mut new_tab = false;
         let mut open_history: Option<(u64, u64)> = None;
         let mut grid_acts = None;
         let focus_req = self.focus_console.take();
@@ -2161,6 +2206,9 @@ impl Workspace {
                 row_ui(ui, tb, |ui| {
                     if icon_btn_ex(ui, ic::RUN, "Execute  ⌘↩", !c.running, false, false).clicked() {
                         run = Some(None);
+                    }
+                    if icon_btn_ex(ui, ic::RUN_NEW_TAB, "Execute in New Tab", !c.running, false, false).clicked() {
+                        (run, new_tab) = (Some(None), true);
                     }
                     if icon_btn(ui, ic::HISTORY, "Browse Query History  ⌥⌘E").clicked() {
                         open_history = Some((c.ds, c.id));
@@ -2308,6 +2356,14 @@ impl Workspace {
                 }
                 grid_acts = Some((GridTarget::Data(d.id), acts));
             }
+            Tab::Result(r) => {
+                let tb = Rect::from_min_size(body.min, vec2(body.width(), 34.0));
+                r.grid.blur_outside(ui, body);
+                let mut acts = r.grid.toolbar(ui, tb, true);
+                let gr = Rect::from_min_max(pos2(body.left(), tb.bottom()), body.max);
+                acts.extend(r.grid.body(ui, gr, Id::new(("result", r.id)), gr.top()));
+                grid_acts = Some((GridTarget::Result(r.id), acts));
+            }
             Tab::File(f) => {
                 let lang = match f.path.extension().and_then(|e| e.to_str()) {
                     Some("json") => Lang::Json,
@@ -2323,7 +2379,7 @@ impl Workspace {
             }
         }
         if let Some(cursor) = run {
-            self.run_console(&ui.ctx().clone(), active, cursor);
+            self.run_console(&ui.ctx().clone(), active, cursor, new_tab);
         }
         if let Some((ds, console)) = open_history {
             self.open_history(ds, console);
@@ -2347,6 +2403,10 @@ impl Workspace {
                 Tab::Data(d) => {
                     (ic::TABLE, format!("{} [{}]", self.short_name(d), ds_name(d.ds)), format!("{}.{} [{}]", d.db, d.coll, ds_name(d.ds)))
                 }
+                Tab::Result(r) => {
+                    let t = r.grid.rs.as_ref().map_or("result".into(), |x| x.title.clone());
+                    (ic::TABLE, format!("{t} [{}]", ds_name(r.ds)), format!("{t} [{}]", ds_name(r.ds)))
+                }
                 Tab::File(f) => (
                     files::file_icon(&f.path),
                     f.path.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned()),
@@ -2363,10 +2423,13 @@ impl Workspace {
     }
 
     fn close_tab(&mut self, i: usize) {
-        if let Tab::Data(d) = &self.tabs[i]
-            && d.grid.dirty()
-        {
-            self.confirm = Some(Confirm::CloseTab(d.id));
+        let grid = match &self.tabs[i] {
+            Tab::Data(d) => Some(&d.grid),
+            Tab::Result(r) => Some(&r.grid),
+            _ => None,
+        };
+        if grid.is_some_and(|g| g.dirty()) {
+            self.confirm = Some(Confirm::CloseTab(self.tabs[i].id()));
             return;
         }
         self.do_close_tab(i);
@@ -2646,7 +2709,7 @@ impl Workspace {
         let text = text.unwrap_or_default();
         if save {
             // like the grid's export: into Downloads
-            let path = PathBuf::from(std::env::var("HOME").unwrap_or_default()).join("Downloads").join(format!("{name}.sql"));
+            let path = config::home().join("Downloads").join(format!("{name}.sql"));
             self.status = Some(match std::fs::write(&path, text) {
                 Ok(_) => format!("Saved to {}", path.display()),
                 Err(e) => format!("Save failed: {e}"),
@@ -2732,6 +2795,11 @@ impl Workspace {
                 }
                 crumbs.push((Some(ic::TABLE), self.short_name(d)));
             }
+            Some(Tab::Result(r)) => {
+                crumbs.push((None, "Database".into()));
+                crumbs.push((Some(driver_icon(self.driver(r.ds))), ds_name(r.ds)));
+                crumbs.push((Some(ic::TABLE), r.grid.rs.as_ref().map_or("result".into(), |x| x.title.clone())));
+            }
             Some(Tab::File(f)) => {
                 let parts: Vec<String> = f.path.iter().map(|p| p.to_string_lossy().into_owned()).filter(|p| p != "/").collect();
                 let n = parts.len();
@@ -2769,8 +2837,8 @@ impl Workspace {
         }
         let right = match tab {
             Some(Tab::Console(c)) => format!("{}:{}     LF     UTF-8     4 spaces", c.line_col.0 + 1, c.line_col.1 + 1),
-            Some(Tab::Data(d)) => d.grid.rs.as_ref().map_or(String::new(), |r| {
-                if d.grid.dirty() { "Pending changes — ⌘↩ to submit".into() } else { format!("{} rows", r.docs.len()) }
+            Some(Tab::Data(DataTab { grid, .. }) | Tab::Result(ResultTab { grid, .. })) => grid.rs.as_ref().map_or(String::new(), |r| {
+                if grid.dirty() { "Pending changes — ⌘↩ to submit".into() } else { format!("{} rows", r.docs.len()) }
             }),
             Some(Tab::File(f)) => {
                 format!("{}:{}     LF     UTF-8", f.line_col.0 + 1, f.line_col.1 + 1)
@@ -3757,7 +3825,7 @@ impl Workspace {
                     }
                 }
                 // no native picker (or cancelled with error): ask for a path
-                None if !cfg!(target_os = "macos") => self.ask = Some(Ask::AttachPath(String::new())),
+                None if !cfg!(target_os = "macos") && !cfg!(windows) => self.ask = Some(Ask::AttachPath(String::new())),
                 _ => {}
             }
         }
@@ -3877,7 +3945,7 @@ enum RowAction {
 
 /// Two-line project row in the widget popup: badge, name, `~/path`; recent ones can be removed.
 fn project_row(ui: &mut Ui, e: &ProjectEntry) -> Option<RowAction> {
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = config::home().display().to_string();
     let path = e.project.path.display().to_string();
     let path = if !home.is_empty() && path.starts_with(&home) { format!("~{}", &path[home.len()..]) } else { path };
     let natural = 44.0 + text_w(ui, &e.project.name, 13.0).max(text_w(ui, &path, 12.0)) + if e.open { 14.0 } else { 34.0 };

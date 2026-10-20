@@ -574,7 +574,14 @@ fn js_err(ctx: &Ctx, e: rquickjs::Error) -> String {
 pub fn stamp(msg: &str) -> String {
     let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    unsafe { libc::localtime_r(&t, &mut tm) };
+    #[cfg(windows)]
+    unsafe {
+        libc::localtime_s(&mut tm, &t)
+    };
+    #[cfg(not(windows))]
+    unsafe {
+        libc::localtime_r(&t, &mut tm)
+    };
     format!("[{:04}-{:02}-{:02} {:02}:{:02}:{:02}] {msg}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec)
 }
 

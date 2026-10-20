@@ -1,3 +1,4 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")] // no console window
 //! DataTired — a DataGrip-style database IDE in Rust (phase 1: MongoDB).
 
 mod app;

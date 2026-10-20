@@ -382,6 +382,13 @@ pub fn code_editor(
     let gw = gutter_width(lines);
     let cw = char_w(ui);
     let mut out = EditorOut { cursor: None, line_col: (0, 0), has_focus: false };
+    // horizontal or vertical, never diagonal (same gesture lock as the data grid)
+    if ui.rect_contains_pointer(rect) {
+        let lid = id.with("scroll-lock");
+        let mut lock = ui.data(|d| d.get_temp(lid)).unwrap_or_default();
+        crate::grid::lock_scroll_axis(ui, &mut lock);
+        ui.data_mut(|d| d.insert_temp(lid, lock));
+    }
     egui::ScrollArea::both().id_salt(id.with("scroll")).auto_shrink([false, false]).show(ui, |ui| {
         let caret_bg = ui.painter().add(Shape::Noop);
         let margin_line = ui.painter().add(Shape::Noop);

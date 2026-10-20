@@ -33,7 +33,7 @@ pub fn resolve_project_path(input: &str) -> Option<PathBuf> {
     if t.is_empty() || t.contains('\0') {
         return None;
     }
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = config::home();
     let p = if t == "~" {
         PathBuf::from(&home)
     } else if let Some(rest) = t.strip_prefix("~/") {
@@ -140,14 +140,7 @@ impl App {
                 let (tx, rx) = channel();
                 let ctx2 = ctx.clone();
                 std::thread::spawn(move || {
-                    let out = std::process::Command::new("osascript")
-                        .args(["-e", "POSIX path of (choose folder with prompt \"Open Project\")"])
-                        .output();
-                    let p = out
-                        .ok()
-                        .filter(|o| o.status.success())
-                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().trim_end_matches('/').to_string());
-                    let _ = tx.send(p);
+                    let _ = tx.send(config::pick_folder("Open Project"));
                     ctx2.request_repaint();
                 });
                 self.picker = Some(rx);
@@ -188,7 +181,7 @@ impl App {
                     let te = ui.add(egui::TextEdit::singleline(text).desired_width(360.0).margin(vec2(8.0, 5.0)));
                     te.request_focus();
                     if let Some(p) = &target {
-                        let home = std::env::var("HOME").unwrap_or_default();
+                        let home = config::home().display().to_string();
                         let shown = p.display().to_string().replacen(&home, "~", 1);
                         let note = if config::project_file(p).exists() { "opens existing project" } else { "will be created" };
                         ui.label(egui::RichText::new(format!("{shown}  ({note})")).size(11.5).color(TEXT_SECONDARY));

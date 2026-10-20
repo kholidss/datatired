@@ -411,12 +411,57 @@ pub fn new_file(dir: &std::path::Path, stem: &str, ext: &str, text: &str) -> Pat
 }
 
 fn dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     if cfg!(target_os = "macos") {
-        PathBuf::from(home).join("Library/Application Support/DataTired")
+        home().join("Library/Application Support/DataTired")
+    } else if cfg!(windows) {
+        std::env::var_os("APPDATA").map_or_else(|| home().join("AppData").join("Roaming"), PathBuf::from).join("DataTired")
     } else {
-        std::env::var("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from(home).join(".config")).join("DataTired")
+        std::env::var("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|_| home().join(".config")).join("DataTired")
     }
+}
+
+/// The user's home folder (`HOME`; on Windows `USERPROFILE`).
+pub fn home() -> PathBuf {
+    std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map_or_else(|| PathBuf::from("."), PathBuf::from)
+}
+
+/// A command without a console window flashing up on Windows.
+fn quiet(program: &str) -> std::process::Command {
+    #[allow(unused_mut)]
+    let mut c = std::process::Command::new(program);
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(&mut c, 0x0800_0000); // CREATE_NO_WINDOW
+    c
+}
+
+/// Native folder chooser (blocks: call it off the UI thread); `None` when cancelled or unavailable.
+pub fn pick_folder(prompt: &str) -> Option<String> {
+    let out = if cfg!(target_os = "macos") {
+        quiet("osascript").args(["-e", &format!("POSIX path of (choose folder with prompt \"{prompt}\")")]).output()
+    } else if cfg!(windows) {
+        let script = format!(
+            "Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.FolderBrowserDialog; \
+             $d.Description = '{prompt}'; if ($d.ShowDialog() -eq 'OK') {{ $d.SelectedPath }} else {{ exit 1 }}"
+        );
+        quiet("powershell").args(["-NoProfile", "-STA", "-Command", &script]).output()
+    } else {
+        return None;
+    };
+    out.ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().trim_end_matches(['/', '\\']).to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Shows a file or folder in Finder / Explorer.
+pub fn reveal(p: &Path) {
+    let _ = if cfg!(windows) {
+        quiet("explorer").arg(format!("/select,{}", p.display())).spawn()
+    } else if cfg!(target_os = "macos") {
+        quiet("open").arg("-R").arg(p).spawn()
+    } else {
+        quiet("xdg-open").arg(p.parent().unwrap_or(p)).spawn()
+    };
 }
 
 /// Pre-projects single config (`config.json`), migrated into the default project once.
@@ -454,7 +499,7 @@ fn load_legacy() -> Config {
 
 /// Where new projects are created by name (DataGrip: `~/DataGripProjects`).
 pub fn projects_home() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join("DataTiredProjects")
+    home().join("DataTiredProjects")
 }
 
 /// A project is a folder holding `.datatired/project.json` (DataGrip: `.idea/dataSources.xml`).

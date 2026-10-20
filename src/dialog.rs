@@ -403,7 +403,8 @@ impl DsDialog {
                     ui.label(RichText::new(format!("{} {v}", ds_clone.driver.name())).color(TEXT_SECONDARY));
                 }
                 TestState::Err(e) => {
-                    ui.label(RichText::new(e.lines().next().unwrap_or_default()).color(ERROR));
+                    // elided to the row (full text on hover): an unwrapped label would widen the modal
+                    ui.add(egui::Label::new(RichText::new(e.lines().next().unwrap_or_default()).color(ERROR)).truncate());
                 }
             }
         });

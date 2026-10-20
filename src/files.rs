@@ -47,10 +47,8 @@ pub fn file_icon(p: &Path) -> ImageSource<'static> {
 }
 
 fn tilde(p: &str) -> String {
-    match std::env::var("HOME") {
-        Ok(h) if p.starts_with(&h) => format!("~{}", &p[h.len()..]),
-        _ => p.to_string(),
-    }
+    let h = crate::config::home().display().to_string();
+    if h != "." && p.starts_with(&h) { format!("~{}", &p[h.len()..]) } else { p.to_string() }
 }
 
 impl Files {

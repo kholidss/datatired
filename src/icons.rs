@@ -73,6 +73,7 @@ pub const QUESTION_DIALOG: ImageSource<'static> = include_image!("../assets/icon
 pub const REFRESH: ImageSource<'static> = include_image!("../assets/icons/refresh.svg");
 pub const REMOVE: ImageSource<'static> = include_image!("../assets/icons/remove.svg");
 pub const RUN: ImageSource<'static> = include_image!("../assets/icons/run.svg");
+pub const RUN_NEW_TAB: ImageSource<'static> = include_image!("../assets/icons/runNewTab.svg");
 pub const SAVE: ImageSource<'static> = include_image!("../assets/icons/save.svg");
 pub const SCHEMA: ImageSource<'static> = include_image!("../assets/icons/schema.svg");
 pub const SCRATCHES: ImageSource<'static> = include_image!("../assets/icons/scratches.svg");

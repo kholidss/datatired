@@ -1513,7 +1513,7 @@ enum CellMenu {
 
 /// Trackpad gestures scroll either horizontally or vertically, never diagonally (like the IDE's
 /// tables): the dominant axis at the start of a gesture wins until it pauses for 250 ms.
-fn lock_scroll_axis(ui: &Ui, lock: &mut ScrollLock) {
+pub(crate) fn lock_scroll_axis(ui: &Ui, lock: &mut ScrollLock) {
     ui.ctx().input_mut(|i| {
         let d = i.smooth_scroll_delta;
         if d != egui::Vec2::ZERO {
@@ -1544,7 +1544,7 @@ fn consume_commit_keys(ui: &Ui) {
 /// until then only the dominant component of each event passes. A short pause starts a new gesture,
 /// and a clearly perpendicular swipe switches axis instead of feeling stuck.
 #[derive(Default, Clone, Copy)]
-struct ScrollLock {
+pub(crate) struct ScrollLock {
     axis: Option<bool>,
     acc: egui::Vec2,
     last: f64,

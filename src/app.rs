@@ -111,8 +111,6 @@ enum Tab {
     Console(Console),
     Data(DataTab),
     File(FileTab),
-    /// Console result opened with Execute in New Tab.
-    Result(ResultTab),
 }
 
 impl Tab {
@@ -121,7 +119,6 @@ impl Tab {
             Tab::Console(c) => c.id,
             Tab::Data(d) => d.id,
             Tab::File(f) => f.id,
-            Tab::Result(r) => r.id,
         }
     }
     fn ds(&self) -> Option<u64> {
@@ -129,7 +126,6 @@ impl Tab {
             Tab::Console(c) => Some(c.ds),
             Tab::Data(d) => Some(d.ds),
             Tab::File(_) => None,
-            Tab::Result(r) => Some(r.ds),
         }
     }
     /// Writes the backing file when it changed (consoles and files autosave like the IDE).
@@ -137,7 +133,7 @@ impl Tab {
         let (path, text, saved, last) = match self {
             Tab::Console(c) => (&c.path, &c.text, &mut c.saved, &mut c.last_save),
             Tab::File(f) => (&f.path, &f.text, &mut f.saved, &mut f.last_save),
-            Tab::Data(_) | Tab::Result(_) => return,
+            Tab::Data(_) => return,
         };
         if text != saved && (force || last.elapsed().as_secs_f32() > 1.0) {
             if let Some(d) = path.parent() {
@@ -711,7 +707,7 @@ impl Workspace {
                     }
                 }
                 (Pending::ResultPage(rid), body) => {
-                    if let Some(r) = self.results_mut().find(|r| r.id == rid) {
+                    if let Some(r) = self.services.results.iter_mut().find(|r| r.id == rid) {
                         match body {
                             Ok(Body::Rows(rs)) => r.grid.set(rs),
                             Err(e) => {
@@ -857,34 +853,19 @@ impl Workspace {
                 }
             }
         }
-        let mut opened = None;
-        if new_tab {
-            for grid in new_results {
-                let id = self.next_id;
-                self.next_id += 1;
-                self.tabs.push(Tab::Result(ResultTab { id, console: cid, ds, grid }));
-                opened.get_or_insert(self.tabs.len() - 1);
-            }
-        } else {
-            if !new_results.is_empty() {
-                self.services.results.retain(|r| r.console != cid);
-            }
-            for grid in new_results {
-                let id = self.next_id;
-                self.next_id += 1;
-                self.services.results.push(ResultTab { id, console: cid, ds, grid });
-                first_result.get_or_insert(self.services.results.len());
-            }
+        // Execute replaces the console's result tabs; Execute in New Tab keeps them
+        if !new_results.is_empty() && !new_tab {
+            self.services.results.retain(|r| r.console != cid);
         }
-        if let Some(i) = opened {
-            self.active = i;
+        for grid in new_results {
+            let id = self.next_id;
+            self.next_id += 1;
+            self.services.results.push(ResultTab { id, console: cid, ds, grid });
+            first_result.get_or_insert(self.services.results.len());
         }
-        // results in editor tabs leave Services alone unless something failed
-        if opened.is_none() || !ok {
-            self.services.active = if ok { first_result.unwrap_or(0) } else { 0 };
-            self.show_services = true;
-            self.show_gen = false;
-        }
+        self.services.active = if ok { first_result.unwrap_or(0) } else { 0 };
+        self.show_services = true;
+        self.show_gen = false;
         let mut name = String::from("console");
         if let Some(Tab::Console(c)) = self.tabs.iter_mut().find(|t| t.id() == cid) {
             c.running = false;
@@ -909,7 +890,7 @@ impl Workspace {
     }
 
     fn refresh_result(&mut self, rid: u64, page: Option<(u64, u64)>) {
-        let Some(r) = self.results_mut().find(|r| r.id == rid) else {
+        let Some(r) = self.services.results.iter_mut().find(|r| r.id == rid) else {
             return;
         };
         let Some(rs) = &r.grid.rs else { return };
@@ -920,22 +901,13 @@ impl Workspace {
         self.send(ds, Req::Page { spec, offset, limit }, Pending::ResultPage(rid));
     }
 
-    /// Console results, in Services and opened as editor tabs.
-    fn results_mut(&mut self) -> impl Iterator<Item = &mut ResultTab> {
-        let tabs = self.tabs.iter_mut().filter_map(|t| match t {
-            Tab::Result(r) => Some(r),
-            _ => None,
-        });
-        self.services.results.iter_mut().chain(tabs)
-    }
-
     fn grid_mut(&mut self, t: GridTarget) -> Option<&mut Grid> {
         match t {
             GridTarget::Data(id) => self.tabs.iter_mut().find_map(|x| match x {
                 Tab::Data(d) if d.id == id => Some(&mut d.grid),
                 _ => None,
             }),
-            GridTarget::Result(id) => self.results_mut().find(|r| r.id == id).map(|r| &mut r.grid),
+            GridTarget::Result(id) => self.services.results.iter_mut().find(|r| r.id == id).map(|r| &mut r.grid),
         }
     }
 
@@ -986,7 +958,7 @@ impl Workspace {
                             Some(Tab::Data(d)) => (d.ds, Some((d.db.clone(), d.coll.clone())), id, false),
                             _ => continue,
                         },
-                        GridTarget::Result(id) => match self.results_mut().find(|r| r.id == id) {
+                        GridTarget::Result(id) => match self.services.results.iter().find(|r| r.id == id) {
                             Some(r) => (r.ds, r.grid.rs.as_ref().and_then(|x| x.table()), id, true),
                             None => continue,
                         },
@@ -998,7 +970,7 @@ impl Workspace {
                 (GridAction::Stop, t) => {
                     let ds = match t {
                         GridTarget::Data(id) => self.tabs.iter().find(|x| x.id() == id).and_then(|x| x.ds()),
-                        GridTarget::Result(id) => self.results_mut().find(|r| r.id == id).map(|r| r.ds),
+                        GridTarget::Result(id) => self.services.results.iter().find(|r| r.id == id).map(|r| r.ds),
                     };
                     if let Some(c) = ds.and_then(|ds| self.sources.iter().find(|s| s.ds.id == ds)).and_then(|s| s.conn.as_ref()) {
                         c.stop();
@@ -1011,7 +983,9 @@ impl Workspace {
                             _ => "export".into(),
                         },
                         GridTarget::Result(id) => self
-                            .results_mut()
+                            .services
+                            .results
+                            .iter()
                             .find(|r| r.id == id)
                             .and_then(|r| r.grid.rs.as_ref())
                             .map_or("result".into(), |r| r.title.clone()),
@@ -2054,51 +2028,39 @@ impl Workspace {
         let galleys: Vec<_> = titles.iter().map(|(_, t)| ui.painter().layout_no_wrap(t.clone(), ui_font(13.0), TEXT)).collect();
         let total = galleys.iter().map(|g| g.size().x + 66.0).sum::<f32>() - 6.0;
         let area = Rect::from_min_max(pos2(strip.left() + 8.0, strip.top()), strip.right_bottom() - vec2(44.0, 0.0));
-        let scroll = egui::ScrollArea::horizontal().id_salt("editor-tabs").auto_shrink([false, false]);
-        rect_ui(ui, area, |ui| {
-            // thin, muted bar in the gap under the tabs
-            let s = &mut ui.spacing_mut().scroll;
-            (s.bar_width, s.bar_outer_margin, s.foreground_color) = (4.0, 1.0, false);
-            scroll.show(ui, |ui| {
-                let (row, _) = ui.allocate_exact_size(vec2(total, 40.0), Sense::hover());
-                let mut x = row.left();
-                for (i, t) in self.tabs.iter().enumerate() {
-                    let (icon, title) = titles[i].clone();
-                    let g = galleys[i].clone();
-                    let w = g.size().x + 60.0;
-                    let r = Rect::from_min_size(pos2(x, row.top() + 6.0), vec2(w, 28.0));
-                    let resp = ui.interact(r, Id::new(("tab", t.id())), Sense::CLICK);
-                    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, i == self.active, &title));
-                    if i == self.active {
-                        // bring a newly activated tab into view
-                        let key = Id::new("editor-tabs-shown");
-                        if ui.data(|d| d.get_temp::<u64>(key)) != Some(t.id()) {
-                            ui.data_mut(|d| d.insert_temp(key, t.id()));
-                            resp.scroll_to_me(None);
-                        }
-                        ui.painter().rect(r, CornerRadius::same(5), TAB_SEL_BG, Stroke::new(1.0, TAB_SEL_BORDER), egui::StrokeKind::Inside);
-                    } else if resp.hovered() {
-                        ui.painter().rect_filled(r, CornerRadius::same(5), TOOLBAR_HOVER);
-                    }
-                    paint_icon(ui, Rect::from_min_size(r.min + vec2(8.0, 6.0), vec2(16.0, 16.0)), icon);
-                    let col = if i == self.active { TEXT } else { TEXT_MUTED };
-                    ui.painter().galley(pos2(r.left() + 30.0, r.center().y - g.size().y / 2.0), g, col);
-                    let cr = Rect::from_center_size(pos2(r.right() - 14.0, r.center().y), vec2(16.0, 16.0));
-                    let cresp = ui.interact(cr, Id::new(("tabx", t.id())), Sense::CLICK);
-                    if i == self.active || resp.hovered() || cresp.hovered() {
-                        if cresp.hovered() {
-                            ui.painter().rect_filled(cr, CornerRadius::same(3), TOOLBAR_HOVER);
-                        }
-                        paint_icon_tinted(ui, cr, ic::CLOSE_SMALL, TEXT_MUTED);
-                    }
-                    if cresp.clicked() || resp.middle_clicked() {
-                        close = Some(i);
-                    } else if resp.clicked() {
-                        clicked = Some(i);
-                    }
-                    x += w + 6.0;
+        tab_strip(ui, area, "editor-tabs", total, |ui, row| {
+            let mut x = row.left();
+            for (i, t) in self.tabs.iter().enumerate() {
+                let (icon, title) = titles[i].clone();
+                let g = galleys[i].clone();
+                let w = g.size().x + 60.0;
+                let r = Rect::from_min_size(pos2(x, row.top() + 6.0), vec2(w, 28.0));
+                let resp = ui.interact(r, Id::new(("tab", t.id())), Sense::CLICK);
+                resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, i == self.active, &title));
+                if i == self.active {
+                    reveal_active_tab(ui, &resp, "editor-tabs", t.id());
+                    ui.painter().rect(r, CornerRadius::same(5), TAB_SEL_BG, Stroke::new(1.0, TAB_SEL_BORDER), egui::StrokeKind::Inside);
+                } else if resp.hovered() {
+                    ui.painter().rect_filled(r, CornerRadius::same(5), TOOLBAR_HOVER);
                 }
-            })
+                paint_icon(ui, Rect::from_min_size(r.min + vec2(8.0, 6.0), vec2(16.0, 16.0)), icon);
+                let col = if i == self.active { TEXT } else { TEXT_MUTED };
+                ui.painter().galley(pos2(r.left() + 30.0, r.center().y - g.size().y / 2.0), g, col);
+                let cr = Rect::from_center_size(pos2(r.right() - 14.0, r.center().y), vec2(16.0, 16.0));
+                let cresp = ui.interact(cr, Id::new(("tabx", t.id())), Sense::CLICK);
+                if i == self.active || resp.hovered() || cresp.hovered() {
+                    if cresp.hovered() {
+                        ui.painter().rect_filled(cr, CornerRadius::same(3), TOOLBAR_HOVER);
+                    }
+                    paint_icon_tinted(ui, cr, ic::CLOSE_SMALL, TEXT_MUTED);
+                }
+                if cresp.clicked() || resp.middle_clicked() {
+                    close = Some(i);
+                } else if resp.clicked() {
+                    clicked = Some(i);
+                }
+                x += w + 6.0;
+            }
         });
         if let Some(i) = clicked {
             self.active = i;
@@ -2356,14 +2318,6 @@ impl Workspace {
                 }
                 grid_acts = Some((GridTarget::Data(d.id), acts));
             }
-            Tab::Result(r) => {
-                let tb = Rect::from_min_size(body.min, vec2(body.width(), 34.0));
-                r.grid.blur_outside(ui, body);
-                let mut acts = r.grid.toolbar(ui, tb, true);
-                let gr = Rect::from_min_max(pos2(body.left(), tb.bottom()), body.max);
-                acts.extend(r.grid.body(ui, gr, Id::new(("result", r.id)), gr.top()));
-                grid_acts = Some((GridTarget::Result(r.id), acts));
-            }
             Tab::File(f) => {
                 let lang = match f.path.extension().and_then(|e| e.to_str()) {
                     Some("json") => Lang::Json,
@@ -2403,10 +2357,6 @@ impl Workspace {
                 Tab::Data(d) => {
                     (ic::TABLE, format!("{} [{}]", self.short_name(d), ds_name(d.ds)), format!("{}.{} [{}]", d.db, d.coll, ds_name(d.ds)))
                 }
-                Tab::Result(r) => {
-                    let t = r.grid.rs.as_ref().map_or("result".into(), |x| x.title.clone());
-                    (ic::TABLE, format!("{t} [{}]", ds_name(r.ds)), format!("{t} [{}]", ds_name(r.ds)))
-                }
                 Tab::File(f) => (
                     files::file_icon(&f.path),
                     f.path.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned()),
@@ -2423,13 +2373,10 @@ impl Workspace {
     }
 
     fn close_tab(&mut self, i: usize) {
-        let grid = match &self.tabs[i] {
-            Tab::Data(d) => Some(&d.grid),
-            Tab::Result(r) => Some(&r.grid),
-            _ => None,
-        };
-        if grid.is_some_and(|g| g.dirty()) {
-            self.confirm = Some(Confirm::CloseTab(self.tabs[i].id()));
+        if let Tab::Data(d) = &self.tabs[i]
+            && d.grid.dirty()
+        {
+            self.confirm = Some(Confirm::CloseTab(d.id));
             return;
         }
         self.do_close_tab(i);
@@ -2557,37 +2504,52 @@ impl Workspace {
         // right: tabs
         let right = Rect::from_min_max(pos2(left.right() + 1.0, body.top()), body.max);
         let strip = Rect::from_min_size(right.min, vec2(right.width(), 38.0));
-        let mut x = strip.left() + 8.0;
         let mut close = None;
         let titles: Vec<(ImageSource<'static>, String)> = std::iter::once((ic::OUTPUT, "Output".to_string()))
             .chain(self.services.results.iter().map(|r| (ic::TABLE, r.grid.rs.as_ref().map_or("result".into(), |x| x.title.clone()))))
             .collect();
-        for (i, (icon, title)) in titles.iter().enumerate() {
-            let g = ui.painter().layout_no_wrap(title.clone(), ui_font(13.0), TEXT);
-            let w = g.size().x + if i == 0 { 38.0 } else { 58.0 };
-            let r = Rect::from_min_size(pos2(x, strip.top() + 5.0), vec2(w, 28.0));
-            let resp = ui.interact(r, Id::new(("svc-tab", i)), Sense::CLICK);
-            resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, i == self.services.active, title));
-            if i == self.services.active {
-                ui.painter().rect(r, CornerRadius::same(5), TAB_SEL_BG, Stroke::new(1.0, TAB_SEL_BORDER), egui::StrokeKind::Inside);
-            } else if resp.hovered() {
-                ui.painter().rect_filled(r, CornerRadius::same(5), TOOLBAR_HOVER);
-            }
-            paint_icon(ui, Rect::from_min_size(r.min + vec2(8.0, 6.0), vec2(16.0, 16.0)), icon.clone());
-            ui.painter().galley(pos2(r.left() + 30.0, r.center().y - g.size().y / 2.0), g, TEXT);
-            if i > 0 {
-                let cr = Rect::from_center_size(pos2(r.right() - 14.0, r.center().y), vec2(16.0, 16.0));
-                let cresp = ui.interact(cr, Id::new(("svc-x", i)), Sense::CLICK);
-                paint_icon_tinted(ui, cr, ic::CLOSE_SMALL, TEXT_MUTED);
-                if cresp.clicked() {
-                    close = Some(i);
+        // Output is 0, result tabs their id
+        let keys: Vec<u64> = std::iter::once(0).chain(self.services.results.iter().map(|r| r.id)).collect();
+        let tabs: Vec<_> = titles
+            .iter()
+            .enumerate()
+            .map(|(i, (_, t))| {
+                let g = ui.painter().layout_no_wrap(t.clone(), ui_font(13.0), TEXT);
+                let w = g.size().x + if i == 0 { 38.0 } else { 58.0 };
+                (g, w)
+            })
+            .collect();
+        let total = tabs.iter().map(|(_, w)| w + 6.0).sum::<f32>() - 6.0;
+        let area = Rect::from_min_max(pos2(strip.left() + 8.0, strip.top()), strip.right_bottom() - vec2(8.0, 0.0));
+        tab_strip(ui, area, "svc-tabs", total, |ui, row| {
+            let mut x = row.left();
+            for (i, (icon, title)) in titles.iter().enumerate() {
+                let (g, w) = tabs[i].clone();
+                let r = Rect::from_min_size(pos2(x, row.top() + 5.0), vec2(w, 28.0));
+                let resp = ui.interact(r, Id::new(("svc-tab", i)), Sense::CLICK);
+                resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, i == self.services.active, title));
+                if i == self.services.active {
+                    reveal_active_tab(ui, &resp, "svc-tabs", keys[i]);
+                    ui.painter().rect(r, CornerRadius::same(5), TAB_SEL_BG, Stroke::new(1.0, TAB_SEL_BORDER), egui::StrokeKind::Inside);
+                } else if resp.hovered() {
+                    ui.painter().rect_filled(r, CornerRadius::same(5), TOOLBAR_HOVER);
                 }
+                paint_icon(ui, Rect::from_min_size(r.min + vec2(8.0, 6.0), vec2(16.0, 16.0)), icon.clone());
+                ui.painter().galley(pos2(r.left() + 30.0, r.center().y - g.size().y / 2.0), g, TEXT);
+                if i > 0 {
+                    let cr = Rect::from_center_size(pos2(r.right() - 14.0, r.center().y), vec2(16.0, 16.0));
+                    let cresp = ui.interact(cr, Id::new(("svc-x", i)), Sense::CLICK);
+                    paint_icon_tinted(ui, cr, ic::CLOSE_SMALL, TEXT_MUTED);
+                    if cresp.clicked() {
+                        close = Some(i);
+                    }
+                }
+                if resp.clicked() && close.is_none() {
+                    self.services.active = i;
+                }
+                x += w + 6.0;
             }
-            if resp.clicked() && close.is_none() {
-                self.services.active = i;
-            }
-            x += w + 6.0;
-        }
+        });
         if let Some(i) = close
             && self.services.results[i - 1].grid.dirty()
         {
@@ -2795,11 +2757,6 @@ impl Workspace {
                 }
                 crumbs.push((Some(ic::TABLE), self.short_name(d)));
             }
-            Some(Tab::Result(r)) => {
-                crumbs.push((None, "Database".into()));
-                crumbs.push((Some(driver_icon(self.driver(r.ds))), ds_name(r.ds)));
-                crumbs.push((Some(ic::TABLE), r.grid.rs.as_ref().map_or("result".into(), |x| x.title.clone())));
-            }
             Some(Tab::File(f)) => {
                 let parts: Vec<String> = f.path.iter().map(|p| p.to_string_lossy().into_owned()).filter(|p| p != "/").collect();
                 let n = parts.len();
@@ -2837,8 +2794,8 @@ impl Workspace {
         }
         let right = match tab {
             Some(Tab::Console(c)) => format!("{}:{}     LF     UTF-8     4 spaces", c.line_col.0 + 1, c.line_col.1 + 1),
-            Some(Tab::Data(DataTab { grid, .. }) | Tab::Result(ResultTab { grid, .. })) => grid.rs.as_ref().map_or(String::new(), |r| {
-                if grid.dirty() { "Pending changes — ⌘↩ to submit".into() } else { format!("{} rows", r.docs.len()) }
+            Some(Tab::Data(d)) => d.grid.rs.as_ref().map_or(String::new(), |r| {
+                if d.grid.dirty() { "Pending changes — ⌘↩ to submit".into() } else { format!("{} rows", r.docs.len()) }
             }),
             Some(Tab::File(f)) => {
                 format!("{}:{}     LF     UTF-8", f.line_col.0 + 1, f.line_col.1 + 1)

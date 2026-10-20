@@ -140,6 +140,33 @@ pub fn rect_ui<R>(ui: &mut Ui, rect: Rect, f: impl FnOnce(&mut Ui) -> R) -> R {
     .inner
 }
 
+/// Tab strip clipped to `rect` that scrolls horizontally (wheel or trackpad) when its tabs, `width`
+/// wide, overflow, with a thin muted bar in the gap under them. `f` paints the tabs in the given row.
+pub fn tab_strip<R>(ui: &mut Ui, rect: Rect, id: &str, width: f32, f: impl FnOnce(&mut Ui, Rect) -> R) -> R {
+    rect_ui(ui, rect, |ui| {
+        let s = &mut ui.spacing_mut().scroll;
+        (s.bar_width, s.bar_outer_margin, s.foreground_color) = (4.0, 1.0, false);
+        egui::ScrollArea::horizontal()
+            .id_salt(id)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let (row, _) = ui.allocate_exact_size(vec2(width, rect.height()), Sense::hover());
+                f(ui, row)
+            })
+            .inner
+    })
+}
+
+/// Scrolls the active tab of strip `id` into view when it becomes active (`key` changes), then
+/// leaves the scroll position to the user.
+pub fn reveal_active_tab(ui: &Ui, resp: &Response, id: &str, key: u64) {
+    let id = egui::Id::new((id, "shown"));
+    if ui.data(|d| d.get_temp::<u64>(id)) != Some(key) {
+        ui.data_mut(|d| d.insert_temp(id, key));
+        resp.scroll_to_me(None);
+    }
+}
+
 /// Draggable splitter between two areas. Returns drag delta along the axis.
 pub fn splitter(ui: &mut Ui, id: &str, rect: Rect, vertical: bool) -> f32 {
     let resp = ui.interact(rect, ui.id().with(id), Sense::DRAG);

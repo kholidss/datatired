@@ -203,13 +203,13 @@ fn explorer_data_editor_console_flow() {
     wait(&mut h, "console result tab", |h| h.query_by_label("shop.customers").is_some());
     settle(&mut h);
     shot(&mut h, "04-console.png");
-    // Execute in New Tab opens the result as an editor tab and leaves the Services result alone
+    // Execute in New Tab keeps the console's Services result tab and adds one; Execute replaces them
     h.get_by_label("Execute in New Tab").click();
-    wait(&mut h, "result editor tab", |h| h.query_by_label("shop.customers [DataTired-mongo@localhost]").is_some());
+    wait(&mut h, "second result tab", |h| h.query_all_by_label("shop.customers").count() == 2);
     settle(&mut h);
-    assert_eq!(h.query_all_by_label("shop.customers").count(), 1, "Services result tab untouched");
     shot(&mut h, "04g-result-in-new-tab.png");
-    project_tab(&h, "console [DataTired-mongo@localhost]").click();
+    h.get_by_label("Execute").click();
+    wait(&mut h, "results replaced", |h| h.query_all_by_label("shop.customers").count() == 1);
     settle(&mut h);
     // the divider between the Services sessions tree and the results is draggable
     let out0 = h.get_by_label("Output").rect();
